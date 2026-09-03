@@ -1,0 +1,13 @@
+bin/
+obj/
+*.user
+
+# Local Claude Code project-recovery checkpoints - not part of the project
+.claude_recovery/
+
+# Runtime data - never commit real backups, restored plaintext, keys, or audit logs
+/backup/
+/restore/
+/audit/
+/logs/
+config/logbackup.yaml

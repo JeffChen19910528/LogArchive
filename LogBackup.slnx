@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LogBackup.CLI/LogBackup.CLI.csproj" />
+    <Project Path="src/LogBackup.Core/LogBackup.Core.csproj" />
+    <Project Path="src/LogBackup.Infrastructure/LogBackup.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/LogBackup.Tests/LogBackup.Tests.csproj" />
+  </Folder>
+</Solution>
