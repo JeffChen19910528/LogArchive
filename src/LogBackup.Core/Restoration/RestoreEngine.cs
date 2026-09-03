@@ -1,7 +1,6 @@
-using System.Formats.Tar;
-using System.IO.Compression;
 using LogBackup.Core.Abstractions;
 using LogBackup.Core.Exceptions;
+using LogBackup.Core.IO;
 using LogBackup.Core.Models;
 
 namespace LogBackup.Core.Restoration;
@@ -23,8 +22,10 @@ public sealed class RestoreResult
 }
 
 /// <summary>
-/// Verifies the stored hash before ever attempting decryption. The hash is only ever used
-/// as an integrity check - it is never used to reconstruct plaintext.
+/// Orchestrates one restore run: verify hash -> decrypt -> extract (tar+gzip, via
+/// <see cref="TarGzExtractor"/>). The stored hash is verified before any attempt at
+/// decryption and is only ever used as an integrity check - it is never used to reconstruct
+/// plaintext.
 /// </summary>
 public sealed class RestoreEngine
 {
@@ -70,89 +71,13 @@ public sealed class RestoreEngine
                 throw new LogBackupException($"Backup artifact is missing on disk: {metadata.ArtifactFileName}");
             }
 
-            string actualHash;
-            await using (var artifactStream = await _storage.OpenReadAsync(metadata.ArtifactFileName, ct))
-            {
-                actualHash = await _hashEngine.ComputeHashAsync(artifactStream, ct);
-            }
-
-            var integrityPassed = actualHash == metadata.Hash;
-
-            await _audit.RecordAsync(new AuditRecord
-            {
-                Event = integrityPassed ? AuditEventType.HashVerificationSuccess : AuditEventType.HashVerificationFailed,
-                BackupId = options.BackupId,
-                Result = integrityPassed ? "success" : "failure",
-            }, ct);
-
-            if (!integrityPassed && !options.Force)
-            {
-                throw new IntegrityVerificationException(
-                    $"Integrity check failed for backup {options.BackupId}. Expected {metadata.Hash}, got {actualHash}. Restore blocked. Use --force to override (audited).");
-            }
-
-            if (!integrityPassed && options.Force)
-            {
-                await _audit.RecordAsync(new AuditRecord
-                {
-                    Event = AuditEventType.RestoreForced,
-                    BackupId = options.BackupId,
-                    Result = "override",
-                    Detail = $"Integrity check FAILED but restore was forced. Expected {metadata.Hash}, got {actualHash}.",
-                }, ct);
-            }
+            var integrityPassed = await VerifyIntegrityAsync(metadata, options, ct);
 
             var restoreRoot = options.OutputDirectory ?? Path.Combine(_defaultRestoreDirectory, options.BackupId);
             Directory.CreateDirectory(restoreRoot);
 
-            byte[] decrypted;
-            try
-            {
-                await using var artifactStream = await _storage.OpenReadAsync(metadata.ArtifactFileName, ct);
-                using var plaintextMs = new MemoryStream();
-                await _encryptionEngine.DecryptAsync(artifactStream, plaintextMs, metadata.KeyId, metadata.Nonce, ct);
-                decrypted = plaintextMs.ToArray();
-            }
-            catch (Exception ex)
-            {
-                await _audit.RecordAsync(new AuditRecord
-                {
-                    Event = AuditEventType.RestoreFailed,
-                    BackupId = options.BackupId,
-                    Result = "failure",
-                    Detail = $"Decryption failed: {ex.Message}",
-                }, ct);
-                throw new DecryptionFailedException($"Failed to decrypt backup {options.BackupId}. Wrong key or corrupted ciphertext.", ex);
-            }
-
-            using var gzipInput = new MemoryStream(decrypted);
-            using var tarStream = new MemoryStream();
-            await using (var gzip = new GZipStream(gzipInput, CompressionMode.Decompress))
-            {
-                await gzip.CopyToAsync(tarStream, ct);
-            }
-            tarStream.Position = 0;
-
-            var filesRestored = 0;
-            using var tarReader = new TarReader(tarStream);
-            while (await tarReader.GetNextEntryAsync(cancellationToken: ct) is { } entry)
-            {
-                var destPath = ResolveSafeDestination(restoreRoot, entry.Name);
-
-                if (!options.Overwrite && File.Exists(destPath))
-                {
-                    throw new LogBackupException(
-                        $"Restore target already exists: {destPath}. Pass --overwrite to allow overwriting existing files.");
-                }
-
-                Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
-                await using var outFile = new FileStream(destPath, FileMode.Create, FileAccess.Write);
-                if (entry.DataStream is not null)
-                {
-                    await entry.DataStream.CopyToAsync(outFile, ct);
-                }
-                filesRestored++;
-            }
+            using var plaintextGzip = await DecryptArtifactAsync(metadata, options.BackupId, ct);
+            var filesRestored = await TarGzExtractor.ExtractAsync(plaintextGzip, restoreRoot, options.Overwrite, ct);
 
             await _audit.RecordAsync(new AuditRecord
             {
@@ -183,18 +108,64 @@ public sealed class RestoreEngine
         }
     }
 
-    /// <summary>Prevents path traversal / zip-slip style attacks from malicious archive entry names.</summary>
-    private static string ResolveSafeDestination(string restoreRoot, string entryName)
+    /// <summary>Hash-verifies the stored artifact and blocks the restore on a mismatch unless the caller passed --force (which is always audited).</summary>
+    private async Task<bool> VerifyIntegrityAsync(BackupMetadata metadata, RestoreOptions options, CancellationToken ct)
     {
-        var fullRoot = Path.GetFullPath(restoreRoot);
-        var rootWithSeparator = fullRoot.EndsWith(Path.DirectorySeparatorChar) ? fullRoot : fullRoot + Path.DirectorySeparatorChar;
-        var combined = Path.GetFullPath(Path.Combine(fullRoot, entryName));
-
-        if (!combined.StartsWith(rootWithSeparator, StringComparison.Ordinal) && combined != fullRoot)
+        string actualHash;
+        await using (var artifactStream = await _storage.OpenReadAsync(metadata.ArtifactFileName, ct))
         {
-            throw new LogBackupException($"Refusing to restore entry with unsafe path: {entryName}");
+            actualHash = await _hashEngine.ComputeHashAsync(artifactStream, ct);
         }
 
-        return combined;
+        var integrityPassed = actualHash == metadata.Hash;
+
+        await _audit.RecordAsync(new AuditRecord
+        {
+            Event = integrityPassed ? AuditEventType.HashVerificationSuccess : AuditEventType.HashVerificationFailed,
+            BackupId = options.BackupId,
+            Result = integrityPassed ? "success" : "failure",
+        }, ct);
+
+        if (!integrityPassed && !options.Force)
+        {
+            throw new IntegrityVerificationException(
+                $"Integrity check failed for backup {options.BackupId}. Expected {metadata.Hash}, got {actualHash}. Restore blocked. Use --force to override (audited).");
+        }
+
+        if (!integrityPassed && options.Force)
+        {
+            await _audit.RecordAsync(new AuditRecord
+            {
+                Event = AuditEventType.RestoreForced,
+                BackupId = options.BackupId,
+                Result = "override",
+                Detail = $"Integrity check FAILED but restore was forced. Expected {metadata.Hash}, got {actualHash}.",
+            }, ct);
+        }
+
+        return integrityPassed;
+    }
+
+    private async Task<MemoryStream> DecryptArtifactAsync(BackupMetadata metadata, string backupId, CancellationToken ct)
+    {
+        try
+        {
+            await using var artifactStream = await _storage.OpenReadAsync(metadata.ArtifactFileName, ct);
+            var plaintextMs = new MemoryStream();
+            await _encryptionEngine.DecryptAsync(artifactStream, plaintextMs, metadata.KeyId, metadata.Nonce, ct);
+            plaintextMs.Position = 0;
+            return plaintextMs;
+        }
+        catch (Exception ex)
+        {
+            await _audit.RecordAsync(new AuditRecord
+            {
+                Event = AuditEventType.RestoreFailed,
+                BackupId = backupId,
+                Result = "failure",
+                Detail = $"Decryption failed: {ex.Message}",
+            }, ct);
+            throw new DecryptionFailedException($"Failed to decrypt backup {backupId}. Wrong key or corrupted ciphertext.", ex);
+        }
     }
 }

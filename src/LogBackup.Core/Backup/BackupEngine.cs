@@ -1,8 +1,7 @@
-using System.Formats.Tar;
-using System.IO.Compression;
 using System.Runtime.InteropServices;
 using LogBackup.Core.Abstractions;
 using LogBackup.Core.Exceptions;
+using LogBackup.Core.IO;
 using LogBackup.Core.Models;
 
 namespace LogBackup.Core.Backup;
@@ -20,14 +19,14 @@ public sealed class BackupResult
 }
 
 /// <summary>
-/// Discovers log files, safely reads them (retrying against transient locks), compresses,
-/// encrypts, hashes, and atomically stores the resulting backup artifact.
+/// Orchestrates one backup run: discover -> read -> pack (tar+gzip) -> encrypt -> hash ->
+/// verify -> atomic rename -> persist metadata. The individual steps live in their own
+/// collaborators (<see cref="LogFileDiscovery"/>, <see cref="SafeFileReader"/>,
+/// <see cref="TarGzPacker"/>, <see cref="MetadataArtifactWriter"/>) so this class only owns
+/// sequencing and the atomic-write/verify contract described in Skill.md §28.
 /// </summary>
 public sealed class BackupEngine
 {
-    private const int MaxReadRetries = 3;
-    private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(250);
-
     private readonly IEncryptionEngine _encryptionEngine;
     private readonly IHashEngine _hashEngine;
     private readonly IStorageProvider _storage;
@@ -49,7 +48,7 @@ public sealed class BackupEngine
     }
 
     public async Task<BackupResult> CreateBackupAsync(
-        Models.BackupSourceConfig source,
+        BackupSourceConfig source,
         string keyId,
         BackupMode mode,
         CancellationToken ct = default)
@@ -73,126 +72,24 @@ public sealed class BackupEngine
                 throw new LogBackupException($"Source directory does not exist: {sourceRoot}");
             }
 
-            var discovered = DiscoverFiles(sourceRoot, source);
-
-            BackupMetadata? previous = mode == BackupMode.Incremental
-                ? (await _metadataStore.ListAsync(ct))
-                    .Where(m => m.Source == sourceRoot && m.Status == BackupStatus.Verified)
-                    .OrderByDescending(m => m.CreatedAtUtc)
-                    .FirstOrDefault()
+            var previous = mode == BackupMode.Incremental
+                ? await FindPreviousVerifiedBackupAsync(sourceRoot, ct)
                 : null;
 
-            var skipped = new List<string>();
-            var included = new List<(string full, string relative, FileInfo info)>();
+            var (packEntries, fileEntries, skipped, originalSize) =
+                await ReadChangedFilesAsync(sourceRoot, source, previous, backupId, ct);
 
-            foreach (var file in discovered)
-            {
-                var info = new FileInfo(file);
-                var relative = Path.GetRelativePath(sourceRoot, file);
-
-                if (mode == BackupMode.Incremental && previous is not null)
-                {
-                    var prevEntry = previous.Files.FirstOrDefault(f => f.RelativePath == relative);
-                    if (prevEntry is not null
-                        && prevEntry.OriginalSize == info.Length
-                        && prevEntry.LastModifiedUtc == info.LastWriteTimeUtc)
-                    {
-                        continue; // unchanged, skip
-                    }
-                }
-
-                included.Add((file, relative, info));
-            }
-
-            // tar -> gzip -> encrypt, streaming through temp buffers.
-            using var tarStream = new MemoryStream();
-            var fileEntries = new List<BackupFileEntry>();
-            long originalSize = 0;
-
-            using (var tarWriter = new TarWriter(tarStream, TarEntryFormat.Pax, leaveOpen: true))
-            {
-                foreach (var (full, relative, info) in included)
-                {
-                    byte[]? bytes = await TryReadFileWithRetryAsync(full, ct);
-                    if (bytes is null)
-                    {
-                        skipped.Add(relative);
-                        await _audit.RecordAsync(new AuditRecord
-                        {
-                            Event = AuditEventType.BackupFailed,
-                            BackupId = backupId,
-                            Source = full,
-                            Result = "failure",
-                            Detail = "File locked, unreadable, or permission denied after retries.",
-                        }, ct);
-                        continue;
-                    }
-
-                    var entry = new PaxTarEntry(TarEntryType.RegularFile, relative.Replace('\\', '/'))
-                    {
-                        DataStream = new MemoryStream(bytes),
-                        ModificationTime = info.LastWriteTimeUtc,
-                    };
-                    await tarWriter.WriteEntryAsync(entry, ct);
-
-                    fileEntries.Add(new BackupFileEntry
-                    {
-                        RelativePath = relative,
-                        OriginalSize = info.Length,
-                        LastModifiedUtc = info.LastWriteTimeUtc,
-                        SourceHash = await _hashEngine.ComputeHashAsync(new MemoryStream(bytes), ct),
-                    });
-                    originalSize += info.Length;
-                }
-            }
-
-            tarStream.Position = 0;
-            using var gzipStream = new MemoryStream();
-            await using (var gzip = new GZipStream(gzipStream, CompressionLevel.Optimal, leaveOpen: true))
-            {
-                await tarStream.CopyToAsync(gzip, ct);
-            }
-            gzipStream.Position = 0;
-            var compressedSize = gzipStream.Length;
+            var pack = await TarGzPacker.PackAsync(packEntries, ct);
+            await using var _packStream = pack.GzipStream;
 
             var artifactName = $"backup_{backupId}.tar.gz.enc";
             var datedDir = $"{now:yyyy}/{now:MM}/{now:dd}";
             var tmpRelativePath = $"{datedDir}/{artifactName}.tmp";
             var finalRelativePath = $"{datedDir}/{artifactName}";
 
-            EncryptionResult encResult;
-            using (var tmpOutput = new MemoryStream())
-            {
-                encResult = await _encryptionEngine.EncryptAsync(gzipStream, tmpOutput, keyId, ct);
-                tmpOutput.Position = 0;
-                await _storage.WriteFileAsync(tmpRelativePath, tmpOutput, ct);
-            }
+            var encResult = await WriteEncryptedArtifactAsync(pack.GzipStream, tmpRelativePath, keyId, ct);
 
-            // Hash the exact stored (still-temporary) artifact.
-            string hash;
-            long encryptedSize;
-            await using (var readBack = await _storage.OpenReadAsync(tmpRelativePath, ct))
-            {
-                encryptedSize = readBack.Length;
-                hash = await _hashEngine.ComputeHashAsync(readBack, ct);
-            }
-            await _audit.RecordAsync(new AuditRecord { Event = AuditEventType.HashGenerated, BackupId = backupId, Result = "success" }, ct);
-
-            // Verify BEFORE renaming: re-read the temp artifact and recompute the hash.
-            string verifyHash;
-            await using (var verifyStream = await _storage.OpenReadAsync(tmpRelativePath, ct))
-            {
-                verifyHash = await _hashEngine.ComputeHashAsync(verifyStream, ct);
-            }
-
-            var status = hash == verifyHash ? BackupStatus.Verified : BackupStatus.IntegrityFailed;
-
-            await _audit.RecordAsync(new AuditRecord
-            {
-                Event = status == BackupStatus.Verified ? AuditEventType.HashVerificationSuccess : AuditEventType.HashVerificationFailed,
-                BackupId = backupId,
-                Result = status == BackupStatus.Verified ? "success" : "failure",
-            }, ct);
+            var (status, hash, encryptedSize) = await VerifyTempArtifactAsync(tmpRelativePath, backupId, ct);
 
             // Only rename .tmp -> final artifact name once verification has actually succeeded.
             if (status == BackupStatus.Verified)
@@ -214,11 +111,11 @@ public sealed class BackupEngine
                 BackupMode = mode.ToString().ToLowerInvariant(),
                 FileCount = fileEntries.Count,
                 OriginalSize = originalSize,
-                CompressedSize = compressedSize,
+                CompressedSize = pack.CompressedSize,
                 EncryptedSize = encryptedSize,
                 EncryptionAlgorithm = encResult.Algorithm,
                 HashAlgorithm = _hashEngine.Algorithm,
-                Hash = verifyHash,
+                Hash = hash,
                 KeyId = encResult.KeyId,
                 Nonce = encResult.NonceBase64,
                 Status = status,
@@ -227,7 +124,7 @@ public sealed class BackupEngine
                 PreviousBackupId = previous?.BackupId,
             };
 
-            await WriteMetadataArtifactsAsync(metadata, datedDir, artifactName, ct);
+            await MetadataArtifactWriter.WriteAsync(_storage, metadata, datedDir, artifactName.Replace(".tar.gz.enc", ""), ct);
             await _metadataStore.SaveAsync(metadata, ct);
 
             await _audit.RecordAsync(new AuditRecord
@@ -255,74 +152,113 @@ public sealed class BackupEngine
         }
     }
 
-    private async Task WriteMetadataArtifactsAsync(BackupMetadata metadata, string datedDir, string artifactName, CancellationToken ct)
+    private async Task<BackupMetadata?> FindPreviousVerifiedBackupAsync(string sourceRoot, CancellationToken ct)
     {
-        var json = System.Text.Json.JsonSerializer.Serialize(metadata, new System.Text.Json.JsonSerializerOptions
-        {
-            WriteIndented = true,
-            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
-        });
-
-        using var metaStream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(json));
-        await _storage.WriteFileAsync($"{datedDir}/{artifactName.Replace(".tar.gz.enc", "")}.metadata.json", metaStream, ct);
-
-        using var hashStream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(metadata.Hash));
-        await _storage.WriteFileAsync($"{datedDir}/{artifactName.Replace(".tar.gz.enc", "")}.sha256", hashStream, ct);
+        var all = await _metadataStore.ListAsync(ct);
+        return all
+            .Where(m => m.Source == sourceRoot && m.Status == BackupStatus.Verified)
+            .OrderByDescending(m => m.CreatedAtUtc)
+            .FirstOrDefault();
     }
 
-    private static async Task<byte[]?> TryReadFileWithRetryAsync(string path, CancellationToken ct)
+    private async Task<(List<TarGzPacker.Entry> PackEntries, List<BackupFileEntry> FileEntries, List<string> Skipped, long OriginalSize)>
+        ReadChangedFilesAsync(string sourceRoot, BackupSourceConfig source, BackupMetadata? previous, string backupId, CancellationToken ct)
     {
-        for (var attempt = 1; attempt <= MaxReadRetries; attempt++)
-        {
-            try
-            {
-                await using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var ms = new MemoryStream();
-                await fs.CopyToAsync(ms, ct);
-                return ms.ToArray();
-            }
-            catch (IOException) when (attempt < MaxReadRetries)
-            {
-                await Task.Delay(RetryDelay, ct);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                return null;
-            }
-            catch (IOException)
-            {
-                return null;
-            }
-        }
-        return null;
-    }
+        var discovered = LogFileDiscovery.DiscoverFiles(sourceRoot, source);
 
-    private static List<string> DiscoverFiles(string sourceRoot, Models.BackupSourceConfig source)
-    {
-        var searchOption = source.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-        var includePatterns = source.Include.Count > 0 ? source.Include : new List<string> { "*" };
-        var matched = new HashSet<string>();
+        var packEntries = new List<TarGzPacker.Entry>();
+        var fileEntries = new List<BackupFileEntry>();
+        var skipped = new List<string>();
+        long originalSize = 0;
 
-        foreach (var pattern in includePatterns)
+        foreach (var file in discovered)
         {
-            foreach (var file in Directory.EnumerateFiles(sourceRoot, pattern, searchOption))
+            var info = new FileInfo(file);
+            var relative = Path.GetRelativePath(sourceRoot, file);
+
+            if (previous is not null && IsUnchangedSince(previous, relative, info))
             {
-                matched.Add(file);
+                continue;
             }
-        }
 
-        if (source.Exclude.Count > 0)
-        {
-            foreach (var pattern in source.Exclude)
+            var bytes = await SafeFileReader.TryReadAsync(file, ct);
+            if (bytes is null)
             {
-                foreach (var file in Directory.EnumerateFiles(sourceRoot, pattern, searchOption))
+                skipped.Add(relative);
+                await _audit.RecordAsync(new AuditRecord
                 {
-                    matched.Remove(file);
-                }
+                    Event = AuditEventType.BackupFailed,
+                    BackupId = backupId,
+                    Source = file,
+                    Result = "failure",
+                    Detail = "File locked, unreadable, or permission denied after retries.",
+                }, ct);
+                continue;
             }
+
+            packEntries.Add(new TarGzPacker.Entry(relative, bytes, info.LastWriteTimeUtc));
+            fileEntries.Add(new BackupFileEntry
+            {
+                RelativePath = relative,
+                OriginalSize = info.Length,
+                LastModifiedUtc = info.LastWriteTimeUtc,
+                SourceHash = await _hashEngine.ComputeHashAsync(new MemoryStream(bytes), ct),
+            });
+            originalSize += info.Length;
         }
 
-        return matched.OrderBy(f => f, StringComparer.Ordinal).ToList();
+        return (packEntries, fileEntries, skipped, originalSize);
+    }
+
+    private static bool IsUnchangedSince(BackupMetadata previous, string relativePath, FileInfo info)
+    {
+        var prevEntry = previous.Files.FirstOrDefault(f => f.RelativePath == relativePath);
+        return prevEntry is not null
+            && prevEntry.OriginalSize == info.Length
+            && prevEntry.LastModifiedUtc == info.LastWriteTimeUtc;
+    }
+
+    private async Task<EncryptionResult> WriteEncryptedArtifactAsync(Stream gzipStream, string tmpRelativePath, string keyId, CancellationToken ct)
+    {
+        using var tmpOutput = new MemoryStream();
+        var encResult = await _encryptionEngine.EncryptAsync(gzipStream, tmpOutput, keyId, ct);
+        tmpOutput.Position = 0;
+        await _storage.WriteFileAsync(tmpRelativePath, tmpOutput, ct);
+        return encResult;
+    }
+
+    /// <summary>
+    /// Atomic-backup contract (Skill.md §28): hash the freshly-written temp artifact, then
+    /// re-read and re-hash it before the caller is allowed to rename it into place. A backup
+    /// is only ever marked Verified once this second read/hash actually matches the first.
+    /// </summary>
+    private async Task<(BackupStatus Status, string Hash, long EncryptedSize)> VerifyTempArtifactAsync(string tmpRelativePath, string backupId, CancellationToken ct)
+    {
+        string hash;
+        long encryptedSize;
+        await using (var readBack = await _storage.OpenReadAsync(tmpRelativePath, ct))
+        {
+            encryptedSize = readBack.Length;
+            hash = await _hashEngine.ComputeHashAsync(readBack, ct);
+        }
+        await _audit.RecordAsync(new AuditRecord { Event = AuditEventType.HashGenerated, BackupId = backupId, Result = "success" }, ct);
+
+        string verifyHash;
+        await using (var verifyStream = await _storage.OpenReadAsync(tmpRelativePath, ct))
+        {
+            verifyHash = await _hashEngine.ComputeHashAsync(verifyStream, ct);
+        }
+
+        var status = hash == verifyHash ? BackupStatus.Verified : BackupStatus.IntegrityFailed;
+
+        await _audit.RecordAsync(new AuditRecord
+        {
+            Event = status == BackupStatus.Verified ? AuditEventType.HashVerificationSuccess : AuditEventType.HashVerificationFailed,
+            BackupId = backupId,
+            Result = status == BackupStatus.Verified ? "success" : "failure",
+        }, ct);
+
+        return (status, verifyHash, encryptedSize);
     }
 
     private static string GenerateBackupId()

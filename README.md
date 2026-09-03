@@ -30,6 +30,7 @@ Original log ──┬──► SHA-256    ──► Integrity check
 - **Audit logging**: every key operation (start/complete/fail, hash verification, restore, delete…) is recorded
 - **Crash recovery**: `repair` finds and cleans up incomplete backup artifacts (`*.tmp`) left behind by an interruption
 - **Multi-language UI**: CLI help text and command output can switch between English and Traditional Chinese at runtime via `--lang`, an environment variable, or the config file (see "Switching the UI language" below)
+- **Standalone executables**: publish a single self-contained file for Windows or Linux directly from a Windows machine — no target-OS build machine or Docker needed (see "Building standalone executables" below)
 
 ## Requirements
 
@@ -40,10 +41,11 @@ Original log ──┬──► SHA-256    ──► Integrity check
 ```
 LogBackup/
 ├── src/
-│   ├── LogBackup.Core/            # domain logic: backup, restore, retention, encryption, hashing
+│   ├── LogBackup.Core/            # domain logic: backup, restore, retention, encryption, hashing, tar/gzip packing
 │   ├── LogBackup.Infrastructure/  # concrete adapters: local storage, key store, SQLite index, audit files, YAML config
-│   └── LogBackup.CLI/             # command-line interface (logbackup)
+│   └── LogBackup.CLI/             # command-line interface (logbackup), incl. UI localization
 ├── tests/LogBackup.Tests/         # automated tests (xUnit)
+├── scripts/publish.ps1            # publishes self-contained single-file executables (Windows + Linux)
 ├── config/                        # configuration file location
 ├── docs/
 ├── Skill.md                       # the full specification document
@@ -59,6 +61,37 @@ dotnet run --project src/LogBackup.CLI -- <command> [options]
 ```
 
 Once built as a release binary, run `logbackup <command> [options]` directly.
+
+### Building standalone executables (Windows & Linux)
+
+You can cross-compile a self-contained, single-file executable for both Windows and Linux directly from a Windows machine — the .NET SDK's cross-publish support handles this without needing a Linux machine, a container, or WSL:
+
+```powershell
+./scripts/publish.ps1
+```
+
+This publishes:
+
+```
+publish/
+├── win-x64/logbackup.exe   # run directly on Windows
+└── linux-x64/logbackup     # copy to a Linux machine, chmod +x, then run
+```
+
+Each executable bundles the .NET runtime — the target machine does not need the .NET SDK or runtime installed. On Linux, mark it executable once after copying it over:
+
+```bash
+chmod +x ./logbackup
+./logbackup config init
+```
+
+To publish other runtime identifiers (e.g. `linux-arm64`, `osx-x64`):
+
+```powershell
+./scripts/publish.ps1 -RuntimeIdentifiers linux-arm64,osx-x64
+```
+
+Under the hood this runs `dotnet publish -r <rid> --self-contained true -p:PublishSingleFile=true`; see `LogBackup.CLI.csproj` for the full set of publish properties. Published binaries are not committed to source control (`/publish/` is gitignored) — rebuild them from source as needed.
 
 ### Switching the UI language
 

@@ -17,6 +17,16 @@
     <AssemblyName>logbackup</AssemblyName>
     <RootNamespace>LogBackup.CLI</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- Cross-compiled, self-contained single-file executables (see scripts/publish.ps1). -->
+    <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!-- Trimming is off: YamlDotNet and Microsoft.Data.Sqlite rely on reflection/native
+         loading patterns that IL trimming can break; single-file + self-contained already
+         gets us a standalone executable without needing a smaller trimmed size. -->
+    <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
 
 </Project>

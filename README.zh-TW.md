@@ -30,6 +30,7 @@
 - **稽核日誌**：所有關鍵操作（開始/完成/失敗、雜湊驗證、還原、刪除…）都會寫入稽核紀錄
 - **崩潰復原**：`repair` 指令可找出並清理因中斷而遺留的未完成備份（`*.tmp`）
 - **多語系介面**：CLI 的說明文字與輸出訊息可即時切換英文／繁體中文，支援 `--lang`、環境變數、設定檔三種切換方式（見下方「切換介面語言」）
+- **獨立執行檔**：可直接在 Windows 上跨編譯出 Windows／Linux 各自的單一自帶執行檔，不需要目標作業系統的建置環境或 Docker（見下方「建置獨立執行檔」）
 
 ## 系統需求
 
@@ -40,10 +41,11 @@
 ```
 LogBackup/
 ├── src/
-│   ├── LogBackup.Core/            # 核心邏輯：備份、還原、保留、加密、雜湊
+│   ├── LogBackup.Core/            # 核心邏輯：備份、還原、保留、加密、雜湊、tar/gzip 打包
 │   ├── LogBackup.Infrastructure/  # 落地實作：本機儲存、金鑰存放、SQLite 索引、稽核檔案、YAML 設定
-│   └── LogBackup.CLI/             # 命令列介面（logbackup）
+│   └── LogBackup.CLI/             # 命令列介面（logbackup），含介面多語系
 ├── tests/LogBackup.Tests/         # 自動化測試（xUnit）
+├── scripts/publish.ps1            # 建置獨立自帶執行檔（Windows + Linux）
 ├── config/                        # 設定檔存放處
 ├── docs/
 ├── Skill.md                       # 完整規格文件
@@ -59,6 +61,37 @@ dotnet run --project src/LogBackup.CLI -- <指令> [選項]
 ```
 
 若已建置發行版執行檔，則直接執行 `logbackup <指令> [選項]`。
+
+### 建置獨立執行檔（Windows 與 Linux）
+
+可以直接在 Windows 機器上跨編譯出 Windows 與 Linux 各自的獨立單一執行檔 — .NET SDK 內建的跨平台發佈能力，不需要 Linux 機器、容器或 WSL：
+
+```powershell
+./scripts/publish.ps1
+```
+
+執行後會產生：
+
+```
+publish/
+├── win-x64/logbackup.exe   # 直接在 Windows 上執行
+└── linux-x64/logbackup     # 複製到 Linux 機器、賦予執行權限後即可執行
+```
+
+每個執行檔都已內含 .NET runtime，目標機器不需要另外安裝 .NET SDK 或 runtime。在 Linux 上複製過去後，第一次執行前記得加上執行權限：
+
+```bash
+chmod +x ./logbackup
+./logbackup config init
+```
+
+若要建置其他執行環境（例如 `linux-arm64`、`osx-x64`）：
+
+```powershell
+./scripts/publish.ps1 -RuntimeIdentifiers linux-arm64,osx-x64
+```
+
+背後實際執行的是 `dotnet publish -r <rid> --self-contained true -p:PublishSingleFile=true`；完整發佈設定可參考 `LogBackup.CLI.csproj`。發佈出來的執行檔不會被提交進版本控制（`/publish/` 已在 `.gitignore` 中排除），需要時請由原始碼重新建置。
 
 ### 切換介面語言
 

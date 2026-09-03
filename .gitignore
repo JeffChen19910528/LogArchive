@@ -1,9 +1,11 @@
 bin/
 obj/
 *.user
+/publish/
 
-# Local Claude Code project-recovery checkpoints - not part of the project
+# Claude Code development artifacts - not part of the published project
 .claude_recovery/
+CLAUDE.md
 
 # Runtime data - never commit real backups, restored plaintext, keys, or audit logs
 /backup/

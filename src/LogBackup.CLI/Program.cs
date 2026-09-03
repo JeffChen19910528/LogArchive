@@ -9,6 +9,19 @@ public static class Program
 {
     public static async Task<int> Main(string[] args)
     {
+        // Windows consoles default to a legacy OEM/ANSI codepage, which garbles the
+        // zh-TW output. Force UTF-8 explicitly; this is a no-op on platforms that are
+        // already UTF-8 by default, and is harmless when output is redirected/piped.
+        try
+        {
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
+        }
+        catch (IOException)
+        {
+            // Output is redirected to something that doesn't support codepage changes
+            // (e.g. certain CI log collectors) - fall back to the default encoding.
+        }
+
         Strings.Current = ResolveStartupLanguage(args);
 
         var configOption = new Option<string?>(
