@@ -4,7 +4,7 @@
 
 A cross-platform (Windows / Linux / macOS) log backup, encryption, integrity-verification, and restoration tool, implemented in .NET 8 (C#).
 
-Built from the specification in [`Skill.md`](./Skill.md): securely archive application/system logs while preserving their integrity, and let authorized personnel restore them back to readable plaintext when needed.
+Securely archive application/system logs while preserving their integrity, and let authorized personnel restore them back to readable plaintext when needed. Usable either as a scriptable CLI (`logbackup <command> [options]`) or, for anyone who'd rather not learn the command syntax, as an arrow-key interactive menu that opens automatically when you double-click the executable (see "Interactive menu" below).
 
 ## Core design principle
 
@@ -30,6 +30,7 @@ Original log ──┬──► SHA-256    ──► Integrity check
 - **Audit logging**: every key operation (start/complete/fail, hash verification, restore, delete…) is recorded
 - **Crash recovery**: `repair` finds and cleans up incomplete backup artifacts (`*.tmp`) left behind by an interruption
 - **Multi-language UI**: CLI help text and command output can switch between English and Traditional Chinese at runtime via `--lang`, an environment variable, or the config file (see "Switching the UI language" below)
+- **Interactive menu**: double-click the executable (or run it with no arguments from a terminal) to get an arrow-key, highlighted-selection menu instead of the raw `--help` text — no command syntax required (see "Interactive menu" below)
 - **Standalone executables**: publish a single self-contained file for Windows or Linux directly from a Windows machine — no target-OS build machine or Docker needed (see "Building standalone executables" below)
 
 ## Requirements
@@ -48,7 +49,6 @@ LogBackup/
 ├── scripts/publish.ps1            # publishes self-contained single-file executables (Windows + Linux)
 ├── config/                        # configuration file location
 ├── docs/
-├── Skill.md                       # the full specification document
 └── LogBackup.slnx                 # solution file
 ```
 
@@ -92,6 +92,37 @@ To publish other runtime identifiers (e.g. `linux-arm64`, `osx-x64`):
 ```
 
 Under the hood this runs `dotnet publish -r <rid> --self-contained true -p:PublishSingleFile=true`; see `LogBackup.CLI.csproj` for the full set of publish properties. Published binaries are not committed to source control (`/publish/` is gitignored) — rebuild them from source as needed.
+
+### Interactive menu
+
+Running `logbackup.exe` with no arguments from a real terminal — or simply double-clicking it in Explorer — opens a menu instead of printing `--help` and exiting:
+
+```
+LogBackup - Interactive Menu
+============================
+You can also close this window and run logbackup.exe with command-line arguments instead.
+↑↓ move   Enter select   Esc exit
+
+ Back up configured log sources
+ List known backups
+ Show details for one backup
+ Verify a backup's integrity
+ Restore a backup
+ Delete a backup
+ Apply retention policy
+ Show current configuration
+ Initialize configuration file
+ Read audit records
+ Repair (clean up incomplete backups)
+ Language: English
+ Exit
+```
+
+- **`↑` / `↓`** moves the highlighted row, **`Enter`** selects it, **`Esc`** exits.
+- Selecting a command prompts for whatever it needs (backup ID, output directory, yes/no flags, ...) and then runs the exact same code path as the equivalent CLI invocation — the menu is just an input layer on top of it, not a separate implementation.
+- The **`Language`** row toggles the whole menu between English and 繁體中文 immediately, without needing `--lang` or an environment variable. This only affects the current session's display — see "Switching the UI language" below to make a language the permanent default.
+- Piped/redirected invocations (scripts, CI, `logbackup.exe --help > out.txt`) are unaffected and always go straight through the normal CLI parser, never the menu.
+- On Windows, if the executable is launched by double-click (its own freshly-spawned console, not one you already had open), the window also pauses on `Press any key to close this window...` after the menu session or a single-shot command finishes, so output never flashes and disappears.
 
 ### Switching the UI language
 
@@ -320,6 +351,3 @@ The CLI returns meaningful exit codes so it integrates cleanly with scheduled jo
 - Restore defaults to a separate directory and never overwrites production logs.
 - For the full list of security requirements and what's not implemented yet, see the "Known gaps" section in [`CLAUDE.md`](./CLAUDE.md).
 
-## Full specification
-
-This project was built from the complete specification in [`Skill.md`](./Skill.md), which covers system architecture, backup modes, key management, audit events, cross-platform requirements, testing requirements, and the Definition of Done. Read it before making architectural changes.

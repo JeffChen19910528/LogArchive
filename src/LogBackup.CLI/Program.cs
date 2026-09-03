@@ -1,4 +1,5 @@
 using System.CommandLine;
+using System.Runtime.InteropServices;
 using LogBackup.CLI.Commands;
 using LogBackup.CLI.Localization;
 using LogBackup.Infrastructure.Configuration;
@@ -47,12 +48,61 @@ public static class Program
         root.AddCommand(AuditCommand.Build(configOption, langOption));
         root.AddCommand(RepairCommand.Build(configOption, langOption));
 
-        var parseResult = await root.InvokeAsync(args);
-        // Command handlers report the tool's own exit codes (see ExitCode.cs) via
-        // Environment.ExitCode; System.CommandLine's own return value only reflects
-        // argument-parsing failures, so a non-zero parse result always wins.
-        return parseResult != 0 ? parseResult : Environment.ExitCode;
+        int exitCode;
+        if (args.Length == 0 && !Console.IsInputRedirected && !Console.IsOutputRedirected)
+        {
+            // No arguments and a real interactive console (not a script/CI pipe): rather than
+            // printing "Required command was not provided." and exiting, hand control to the
+            // numbered menu so someone who double-clicked the .exe never has to know the CLI
+            // syntax at all.
+            exitCode = await InteractiveMenu.RunAsync(root);
+        }
+        else
+        {
+            var parseResult = await root.InvokeAsync(args);
+            // Command handlers report the tool's own exit codes (see ExitCode.cs) via
+            // Environment.ExitCode; System.CommandLine's own return value only reflects
+            // argument-parsing failures, so a non-zero parse result always wins.
+            exitCode = parseResult != 0 ? parseResult : Environment.ExitCode;
+        }
+
+        if (ShouldPauseBeforeExit())
+        {
+            Console.WriteLine();
+            Console.Write(Strings.T("root.press_any_key"));
+            Console.ReadKey(intercept: true);
+        }
+
+        return exitCode;
     }
+
+    /// <summary>
+    /// Double-clicking the published .exe in Explorer spawns a brand-new console that closes
+    /// the instant the process exits, so any output flashes and disappears. Detect that case -
+    /// running on Windows, with a real (non-redirected) console, and no other process sharing
+    /// it - and hold the window open with a keypress prompt. A console launched from an
+    /// existing terminal always has the parent shell attached too, so this never fires (and
+    /// never blocks) for normal interactive or scripted/CI use.
+    /// </summary>
+    private static bool ShouldPauseBeforeExit()
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        if (Console.IsInputRedirected || Console.IsOutputRedirected) return false;
+
+        try
+        {
+            var processIds = new uint[8];
+            var attachedCount = GetConsoleProcessList(processIds, (uint)processIds.Length);
+            return attachedCount == 1;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint GetConsoleProcessList(uint[] processList, uint processCount);
 
     /// <summary>
     /// Command descriptions and --help text are built before System.CommandLine parses
