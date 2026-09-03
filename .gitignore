@@ -6,6 +6,7 @@ obj/
 # Claude Code development artifacts - not part of the published project
 .claude_recovery/
 CLAUDE.md
+Skill.md
 
 # Runtime data - never commit real backups, restored plaintext, keys, or audit logs
 /backup/
