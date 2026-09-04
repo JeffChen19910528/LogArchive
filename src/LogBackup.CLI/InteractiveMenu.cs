@@ -1,5 +1,6 @@
 using System.CommandLine;
 using LogBackup.CLI.Localization;
+using LogBackup.Core.Models;
 
 namespace LogBackup.CLI;
 
@@ -9,6 +10,9 @@ namespace LogBackup.CLI;
 /// the CLI syntax. Each menu choice is translated into the same argv a command-line invocation
 /// would use and run through the existing <see cref="RootCommand"/>, so there is exactly one
 /// implementation of every command's behavior - this is only an input/output layer on top of it.
+/// Wherever a value can be chosen from existing state (a backup ID, a configured source path,
+/// yes/no) the menu offers an arrow-key list instead of asking the user to type it; free-text
+/// entry is reserved for values with no enumerable set (an arbitrary filesystem path).
 /// </summary>
 public static class InteractiveMenu
 {
@@ -31,7 +35,12 @@ public static class InteractiveMenu
 
         while (true)
         {
-            var choice = SelectFromMenu(actions, selectedIndex);
+            var choice = Select(
+                Strings.T("menu.title"),
+                new[] { Strings.T("menu.hint"), Strings.T("menu.nav_hint") },
+                actions.Select(Label).ToArray(),
+                selectedIndex);
+
             if (choice is null || actions[choice.Value] == Action.Exit)
             {
                 return ExitCode.Success;
@@ -47,7 +56,7 @@ public static class InteractiveMenu
             }
 
             Console.Clear();
-            var argv = BuildArgv(action);
+            var argv = await BuildArgv(action);
             if (argv is null)
             {
                 Console.WriteLine(Strings.T("menu.prompt.invalid"));
@@ -64,25 +73,29 @@ public static class InteractiveMenu
     }
 
     /// <summary>
-    /// Renders the menu with the current item highlighted (inverted colors) and reads
+    /// Renders a titled list with the current item highlighted (inverted colors) and reads
     /// Up/Down/Enter/Esc directly via ReadKey - no typing a number, no pressing Enter to submit
     /// a line. Redraws only the two changed rows on each arrow press to avoid flicker/scrolling.
+    /// This is the one selection primitive every menu, yes/no, and pick-from-list prompt below
+    /// is built on, so there is a single place that owns keyboard handling and rendering.
     /// </summary>
-    private static int? SelectFromMenu(Action[] actions, int initialIndex)
+    private static int? Select(string title, string[] hintLines, string[] labels, int initialIndex)
     {
         Console.Clear();
-        Console.WriteLine(Strings.T("menu.title"));
-        Console.WriteLine(new string('=', VisualWidth(Strings.T("menu.title"))));
-        Console.WriteLine(Strings.T("menu.hint"));
-        Console.WriteLine(Strings.T("menu.nav_hint"));
+        Console.WriteLine(title);
+        Console.WriteLine(new string('=', VisualWidth(title)));
+        foreach (var hint in hintLines)
+        {
+            Console.WriteLine(hint);
+        }
         Console.WriteLine();
 
         var top = Console.CursorTop;
-        var selected = Math.Clamp(initialIndex, 0, actions.Length - 1);
+        var selected = Math.Clamp(initialIndex, 0, labels.Length - 1);
 
-        for (var i = 0; i < actions.Length; i++)
+        for (var i = 0; i < labels.Length; i++)
         {
-            DrawRow(actions, i, top + i, highlighted: i == selected);
+            DrawRow(labels, i, top + i, highlighted: i == selected);
         }
 
         while (true)
@@ -93,10 +106,10 @@ public static class InteractiveMenu
             switch (key)
             {
                 case ConsoleKey.UpArrow:
-                    selected = (selected - 1 + actions.Length) % actions.Length;
+                    selected = (selected - 1 + labels.Length) % labels.Length;
                     break;
                 case ConsoleKey.DownArrow:
-                    selected = (selected + 1) % actions.Length;
+                    selected = (selected + 1) % labels.Length;
                     break;
                 case ConsoleKey.Enter:
                     return selected;
@@ -106,16 +119,15 @@ public static class InteractiveMenu
                     continue;
             }
 
-            DrawRow(actions, previous, top + previous, highlighted: false);
-            DrawRow(actions, selected, top + selected, highlighted: true);
+            DrawRow(labels, previous, top + previous, highlighted: false);
+            DrawRow(labels, selected, top + selected, highlighted: true);
         }
     }
 
-    private static void DrawRow(Action[] actions, int index, int row, bool highlighted)
+    private static void DrawRow(string[] labels, int index, int row, bool highlighted)
     {
         Console.SetCursorPosition(0, row);
-        var label = Label(actions[index]);
-        var text = $" {label,-50}";
+        var text = $" {labels[index],-50}";
 
         if (highlighted)
         {
@@ -152,34 +164,102 @@ public static class InteractiveMenu
     private static int VisualWidth(string text) =>
         text.Sum(c => c > 0x2E80 ? 2 : 1);
 
-    private static string[]? BuildArgv(Action action) => action switch
+    private static async Task<string[]?> BuildArgv(Action action) => action switch
     {
-        Action.Backup => BuildBackup(),
+        Action.Backup => await BuildBackup(),
         Action.List => new[] { "list" },
-        Action.Info => BuildWithId("info"),
-        Action.Verify => BuildWithId("verify"),
-        Action.Restore => BuildRestore(),
-        Action.Delete => BuildDelete(),
+        Action.Info => await BuildWithId("info"),
+        Action.Verify => await BuildWithId("verify"),
+        Action.Restore => await BuildRestore(),
+        Action.Delete => await BuildDelete(),
         Action.Retention => BuildRetention(),
         Action.ConfigShow => new[] { "config", "show" },
         Action.ConfigInit => new[] { "config", "init" },
-        Action.Audit => BuildAudit(),
+        Action.Audit => await BuildAudit(),
         Action.Repair => BuildRepair(),
         _ => null,
     };
 
-    private static string[] BuildBackup()
+    /// <summary>
+    /// Backups known to the metadata store, newest first, for picking a --id by arrow keys
+    /// instead of typing one. Returns empty (never throws) if the config/database aren't set
+    /// up yet, so callers can fall back to manual entry.
+    /// </summary>
+    private static async Task<IReadOnlyList<BackupMetadata>> LoadBackupsAsync()
+    {
+        try
+        {
+            var app = AppServices.Create(null);
+            var backups = await app.MetadataStore.ListAsync();
+            return backups.OrderByDescending(b => b.CreatedAtUtc).ToList();
+        }
+        catch
+        {
+            return Array.Empty<BackupMetadata>();
+        }
+    }
+
+    private static List<BackupSourceConfig> LoadConfiguredSources()
+    {
+        try
+        {
+            return AppServices.Create(null).Config.Backup.Sources;
+        }
+        catch
+        {
+            return new List<BackupSourceConfig>();
+        }
+    }
+
+    private static string BackupRowLabel(BackupMetadata b) =>
+        $"{b.BackupId}  {b.CreatedAtUtc.LocalDateTime:yyyy-MM-dd HH:mm}  {b.Status}";
+
+    /// <summary>
+    /// Lets the user pick a backup ID from the known list (arrow keys) instead of typing it;
+    /// always keeps a manual-entry option at the end for an ID the local index doesn't have yet.
+    /// Returns null if the user cancels.
+    /// </summary>
+    private static async Task<string?> SelectBackupId(string titleKey)
+    {
+        var backups = await LoadBackupsAsync();
+        var manualLabel = Strings.T("menu.item.manual_entry");
+
+        if (backups.Count == 0)
+        {
+            Console.WriteLine(Strings.T("menu.info.no_backups"));
+            return PromptOrNull("menu.prompt.id");
+        }
+
+        var labels = backups.Select(BackupRowLabel).Append(manualLabel).ToArray();
+        var choice = Select(Strings.T(titleKey), Array.Empty<string>(), labels, 0);
+        if (choice is null)
+        {
+            return null;
+        }
+
+        return choice.Value < backups.Count
+            ? backups[choice.Value].BackupId
+            : PromptOrNull("menu.prompt.id");
+    }
+
+    private static string? PromptOrNull(string key)
+    {
+        var value = Prompt(key);
+        return string.IsNullOrWhiteSpace(value) ? null : value;
+    }
+
+    private static async Task<string[]> BuildBackup()
     {
         var args = new List<string> { "backup" };
 
-        var source = Prompt("menu.prompt.backup_source");
+        var source = await SelectBackupSource();
         if (!string.IsNullOrWhiteSpace(source))
         {
             args.Add("--source");
             args.Add(source);
         }
 
-        if (PromptYesNo("menu.prompt.backup_incremental"))
+        if (SelectYesNo("menu.prompt.backup_incremental"))
         {
             args.Add("--incremental");
         }
@@ -187,9 +267,38 @@ public static class InteractiveMenu
         return args.ToArray();
     }
 
-    private static string[]? BuildWithId(string command)
+    /// <summary>
+    /// Offers the source directories already listed in the config file as pickable options
+    /// (so the common case needs no typing at all), plus "use every configured source" and
+    /// a manual-entry fallback for a one-off path that isn't in the config.
+    /// </summary>
+    private static async Task<string?> SelectBackupSource()
     {
-        var id = Prompt("menu.prompt.id");
+        var configured = LoadConfiguredSources();
+        var useConfigLabel = Strings.T("menu.item.use_config_sources");
+        var manualLabel = Strings.T("menu.item.manual_entry");
+
+        var labels = new List<string> { useConfigLabel };
+        labels.AddRange(configured.Select(s => s.Path));
+        labels.Add(manualLabel);
+
+        var choice = Select(Strings.T("menu.prompt.backup_source_title"), Array.Empty<string>(), labels.ToArray(), 0);
+        if (choice is null || choice.Value == 0)
+        {
+            return null;
+        }
+
+        if (choice.Value == labels.Count - 1)
+        {
+            return await Task.FromResult(Prompt("menu.prompt.backup_source"));
+        }
+
+        return configured[choice.Value - 1].Path;
+    }
+
+    private static async Task<string[]?> BuildWithId(string command)
+    {
+        var id = await SelectBackupId("menu.prompt.id_title");
         if (string.IsNullOrWhiteSpace(id))
         {
             Console.WriteLine(Strings.T("menu.error.id_required"));
@@ -199,9 +308,9 @@ public static class InteractiveMenu
         return new[] { command, "--id", id };
     }
 
-    private static string[]? BuildRestore()
+    private static async Task<string[]?> BuildRestore()
     {
-        var id = Prompt("menu.prompt.id");
+        var id = await SelectBackupId("menu.prompt.id_title");
         if (string.IsNullOrWhiteSpace(id))
         {
             Console.WriteLine(Strings.T("menu.error.id_required"));
@@ -217,15 +326,15 @@ public static class InteractiveMenu
             args.Add(output);
         }
 
-        if (PromptYesNo("menu.prompt.restore_overwrite")) args.Add("--overwrite");
-        if (PromptYesNo("menu.prompt.restore_force")) args.Add("--force");
+        if (SelectYesNo("menu.prompt.restore_overwrite")) args.Add("--overwrite");
+        if (SelectYesNo("menu.prompt.restore_force")) args.Add("--force");
 
         return args.ToArray();
     }
 
-    private static string[]? BuildDelete()
+    private static async Task<string[]?> BuildDelete()
     {
-        var id = Prompt("menu.prompt.id");
+        var id = await SelectBackupId("menu.prompt.id_title");
         if (string.IsNullOrWhiteSpace(id))
         {
             Console.WriteLine(Strings.T("menu.error.id_required"));
@@ -233,7 +342,7 @@ public static class InteractiveMenu
         }
 
         var args = new List<string> { "delete", "--id", id };
-        if (PromptYesNo("menu.prompt.delete_force")) args.Add("--force");
+        if (SelectYesNo("menu.prompt.delete_force")) args.Add("--force");
         // Deliberately never pass --yes: the delete command's own interactive
         // y/N confirmation prompt is exactly what a menu user expects here.
         return args.ToArray();
@@ -242,26 +351,54 @@ public static class InteractiveMenu
     private static string[] BuildRetention()
     {
         var args = new List<string> { "retention" };
-        if (PromptYesNo("menu.prompt.retention_dry_run")) args.Add("--dry-run");
+        if (SelectYesNo("menu.prompt.retention_dry_run")) args.Add("--dry-run");
         return args.ToArray();
     }
 
-    private static string[] BuildAudit()
+    private static async Task<string[]> BuildAudit()
     {
         var args = new List<string> { "audit" };
-        var id = Prompt("menu.prompt.audit_id");
-        if (!string.IsNullOrWhiteSpace(id))
+
+        var backups = await LoadBackupsAsync();
+        if (backups.Count > 0)
         {
-            args.Add("--id");
-            args.Add(id);
+            var allLabel = Strings.T("menu.item.audit_all");
+            var manualLabel = Strings.T("menu.item.manual_entry");
+            var labels = new List<string> { allLabel };
+            labels.AddRange(backups.Select(BackupRowLabel));
+            labels.Add(manualLabel);
+
+            var choice = Select(Strings.T("menu.prompt.audit_id_title"), Array.Empty<string>(), labels.ToArray(), 0);
+            if (choice is not null && choice.Value != 0)
+            {
+                var id = choice.Value == labels.Count - 1
+                    ? Prompt("menu.prompt.audit_id")
+                    : backups[choice.Value - 1].BackupId;
+
+                if (!string.IsNullOrWhiteSpace(id))
+                {
+                    args.Add("--id");
+                    args.Add(id);
+                }
+            }
         }
+        else
+        {
+            var id = Prompt("menu.prompt.audit_id");
+            if (!string.IsNullOrWhiteSpace(id))
+            {
+                args.Add("--id");
+                args.Add(id);
+            }
+        }
+
         return args.ToArray();
     }
 
     private static string[] BuildRepair()
     {
         var args = new List<string> { "repair" };
-        if (PromptYesNo("menu.prompt.repair_delete")) args.Add("--delete");
+        if (SelectYesNo("menu.prompt.repair_delete")) args.Add("--delete");
         return args.ToArray();
     }
 
@@ -271,11 +408,14 @@ public static class InteractiveMenu
         return Console.ReadLine()?.Trim() ?? string.Empty;
     }
 
-    private static bool PromptYesNo(string key)
+    /// <summary>
+    /// Arrow-key Yes/No picker replacing the old "type y/N and press Enter" prompts.
+    /// "No" is pre-selected to match the [y/N] default every one of these prompts documented.
+    /// </summary>
+    private static bool SelectYesNo(string key)
     {
-        Console.Write(Strings.T(key));
-        var answer = Console.ReadLine()?.Trim();
-        return string.Equals(answer, "y", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(answer, "yes", StringComparison.OrdinalIgnoreCase);
+        var labels = new[] { Strings.T("menu.yes"), Strings.T("menu.no") };
+        var choice = Select(Strings.T(key), Array.Empty<string>(), labels, initialIndex: 1);
+        return choice == 0;
     }
 }

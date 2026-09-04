@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/LogBackup.CLI/LogBackup.CLI.csproj" />
     <Project Path="src/LogBackup.Core/LogBackup.Core.csproj" />
+    <Project Path="src/LogBackup.Gui/LogBackup.Gui.csproj" />
     <Project Path="src/LogBackup.Infrastructure/LogBackup.Infrastructure.csproj" />
   </Folder>
   <Folder Name="/tests/">

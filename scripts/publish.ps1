@@ -29,13 +29,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$project = Join-Path $repoRoot "src\LogBackup.CLI\LogBackup.CLI.csproj"
+$cliProject = Join-Path $repoRoot "src\LogBackup.CLI\LogBackup.CLI.csproj"
+$guiProject = Join-Path $repoRoot "src\LogBackup.Gui\LogBackup.Gui.csproj"
 
 foreach ($rid in $RuntimeIdentifiers) {
     $outDir = Join-Path $OutputRoot $rid
     Write-Host "==> Publishing $rid to $outDir" -ForegroundColor Cyan
 
-    dotnet publish $project `
+    dotnet publish $cliProject `
         -c Release `
         -r $rid `
         --self-contained true `
@@ -55,6 +56,32 @@ foreach ($rid in $RuntimeIdentifiers) {
     }
     else {
         throw "Expected output executable not found: $exePath"
+    }
+
+    # WinForms GUI is Windows-only (net8.0-windows) - only publish it for win-* RIDs.
+    if ($rid.StartsWith("win-")) {
+        Write-Host "==> Publishing GUI for $rid to $outDir" -ForegroundColor Cyan
+
+        dotnet publish $guiProject `
+            -c Release `
+            -r $rid `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -o $outDir
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "dotnet publish failed for GUI RID '$rid' (exit code $LASTEXITCODE)"
+        }
+
+        $guiExePath = Join-Path $outDir "logbackup-gui.exe"
+        if (Test-Path $guiExePath) {
+            $guiSizeMb = [Math]::Round((Get-Item $guiExePath).Length / 1MB, 1)
+            Write-Host "    -> $guiExePath ($guiSizeMb MB)" -ForegroundColor Green
+        }
+        else {
+            throw "Expected output executable not found: $guiExePath"
+        }
     }
 }
 
